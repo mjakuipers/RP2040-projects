@@ -1,0 +1,306 @@
+.program hp41_pio_sync
+
+; ****************************************
+; **   HP41 PIO interface 
+; **   state machine for SYNC functions and ISA input
+; **   (C) 2023 Meindert Kuipers
+; ****************************************
+; **
+; ** main SYNC and inout for ISA INSTRUCTION and ISA ADDRESS
+; ** pushing instruction and address bits in the RX FIFO
+; ** FIFO access is non-blocking so we do not miss any clocks
+
+; ** pins used:     
+; **    inputs:     CLK01       GPIO07
+; **                CLK02       GPIO08
+; **                DATA        GPIO09
+; **                ISA         GPIO10
+; **                SYNC        GPIO11
+; **   outputs:     D0_TIME     GPIO26, active low signal!
+; **                                    is active low during DATA bit D0 between the rising edges of CLK02
+; **                                    used to end DATA cycle and to issue the ISA carry bit when requested
+; **                                    used for timing FI flag output
+; **                SYNC_TIME   GPIO27
+; **                                    active during ISA INSTRACTION, same as SYNC but at all cycles
+; **                                    used for timing ISA INSTRUCTION output
+; **    
+; ** input pin base will be 10, we input ISA and one extra SYNC
+; ** sideset pin base will be 26, this allows us to control D0_TIME and SYNC_TIME
+
+.side_set 2                             ; 2 pins used for side_set D0_TIME and SYNC_TIME
+
+public sync_start:                      ; for a forced jump after PWO event
+        wait 1 gpio 11          side 1  ; wait for SYNC to go high, clear D0_TIME and SYNC_TIME
+                                        ; SYNC could already be high in light sleep (standby) but no clocks in that case
+                                        ; now at first rising edge of SYNC after PWO, sample ISA INSTRUCTION
+.wrap_target
+loop_main:                              ; main loop of the ISA/SYNC state machine  
+        set x,9                 side 3  ; number of samples for ISA INSTRUCTION, set SYNC_TIME
+loop_instr:
+        wait 0 gpio 7           side 3  ; wait for falling edge of CLK01
+        wait 1 gpio 7           side 3  ; wait for rising edge of CLK01
+        in pins,1               side 3  ; input 1 bit from ISA into the ISR
+        jmp x-- loop_instr      side 3  ; decrement X and jump into the loop until x=0
+        in pins,2               side 3  ; one last input to capture SYNC status, 12 bits total
+
+        push noblock            side 3  ; push the ISR to the Input FIFO, do not wait if full! ISR is clear
+        wait 1 gpio 8           side 3  ; wait for rising edge of CLK02
+                                        ; now in phase 0
+        wait 0 gpio 8           side 1  ; wait for falling edge of CLK02, clear SYNC_TIME with sideset
+        wait 1 gpio 8           side 1  ; wait for rising edge of CLK02, now in phase 1
+        wait 0 gpio 8           side 1  ; wait for falling edge of CLK02
+        wait 1 gpio 8           side 1  ; wait for rising edge of CLK02, now in phase 2
+                                        ; this marks the start of D0
+
+        wait 0 gpio 8           side 0  ; wait for falling edge of CLK02
+        wait 1 gpio 8           side 0  ; wait for rising edge of CLK02, now in phase 3
+                                        ; this is the end of the D0 bit time
+
+        set x, 28               side 1  ; number of cycles until end of ISA ADDRESS, D0_TIME is cleared by sideset
+loop_addr:                              ; loop to sample ISA ADDRESS
+        wait 1 gpio 7           side 1  ; wait for rising edge of CLK01
+        in pins,1               side 1  ; input 1 bit from ISA into the ISR
+        wait 0 gpio 7           side 1  ; wait for falling edge of CLK01
+        jmp x-- loop_addr       side 1  ; decrement X and jump into the loop until x=0
+
+        push noblock            side 1  ; push the ISR to the Input FIFO, do not wait if full! ISR is cleared
+                                        ; after the push we are in phase 31
+
+        set x,14                side 1  ; number of cycles until start of ISA INSTRUCTION
+loop_iwait:                 
+        wait 0 gpio 8           side 1  ; wait for falling edge of CLK02
+        wait 1 gpio 8           side 1  ; wait for rising edge of CLK02
+        jmp x-- loop_iwait      side 1  ; decrement X and jump into the loop until x=0
+.wrap                                   ; now at the rising edge of CLK02 at SYNC time so ready to return back to the main loop
+
+; 25 instructions
+
+//
+// helper functions for hp41_pio_sync
+//
+
+% c-sdk {
+static inline void hp41_pio_sync_program_init(PIO pio, uint sm, uint offset, 
+        uint in_base_pin,               // base for input pin ISA and SYNC
+        uint sideset_base_pin)          // base for sideset outputs D0_TIME and SYNC_TIME
+
+{
+    pio_sm_config c = hp41_pio_sync_program_get_default_config(offset);
+
+    // IO mapping
+    sm_config_set_in_pins(&c, in_base_pin);
+    sm_config_set_sideset_pins(&c, sideset_base_pin);
+
+    // Configure Input Shift Register ISR
+    // Shifting to right matches HP41 bit order
+    sm_config_set_in_shift(
+        &c,
+        true,  // Shift-to-right = false (i.e. shift to left)
+        false,  // Autopush disabled, we push on the right moment
+        32      // Autopush threshold = 32, but not used anyway here
+    );
+
+    // set correct pin direction for outputs
+    pio_sm_set_consecutive_pindirs(pio, sm, sideset_base_pin, 2, true);      // pin direction 2 output pins D0_TIME and SYNC_TIME
+
+    // connect the pins to the PIO for output
+    pio_gpio_init(pio, sideset_base_pin);           // D0_TIME
+    pio_gpio_init(pio, sideset_base_pin + 1);       // SYNC_TIME
+
+    // load the configuration and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+
+    // and start the pio state machine
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+.program hp41_pio_datain
+
+; ****************************************
+; **   HP41 PIO interface
+; **   state machine for DATA input
+; **   (C) 2023 Meindert Kuipers
+; ****************************************
+
+; ** pushing the bits in the RX FIFO, threshold set at 32 to capture address at cycle 32
+; ** FIFO access is non-blocking so we never miss any clocks
+; ** in any case C-level software must be fast enough to empty FIFO otherwise the DATA will be out of sync
+
+; ** pins used:     
+; **    inputs:     CLK01       GPIO07  HP41 CLK01 signal
+; **                CLK02       GPIO08  HP41 CLK02 signal
+; **                DATA        GPIO09  HP41 DATA signal
+; **                ISA         GPIO10  HP41 ISA signal
+; **                SYNC        GPIO11  HP41 SYNC signal
+; **                D0_TIME     GPIO26, active low signal!
+; **                                    is active low during DATA bit D0 between the rising edges of CLK02
+; **                                    used to end DATA cycle and to issue the ISA carry bit when requested
+; **                                    used for timing FI flag output
+; **                SYNC_TIME   GPIO27  active during ISA INSTRUCTION, same as SYNC but at all cycles
+; **                                    used for timing ISA INSTRUCTION output
+; **    
+
+; ** input pin base will be 10, we only input DATA
+; ** jmp pin base will be 26, this is D0_TIME
+
+public data_start:                      ; for forcing a restart of this state machine on PWO
+        wait 1 gpio 27                  ; wait for SYNC_TIME to go high
+                                        ; we then know that the sync/isa state machine is running
+                                        ; and that there will be 12 data bits read
+                                        ; this allows for more reliable sync when starting
+.wrap_target                            ; free return to start of main capture loop
+        wait 1 gpio 7                   ; wait for rising edge of CLK01
+        jmp pin, data_in                ; check D0_TIME pin, if high no action, continue to read DATA
+                                        ; when D0_TIME is active (low) we need to push the ISR to the FIFO
+                                        ; as we are at the end of the DATA cycle
+        push noblock                    ; push ISR, never block
+data_in:
+        in pins, 1                      ; read DATA pin into ISR
+        wait 0 gpio 7                   ; wait for falling edge of CLK01, and then into next phase
+.wrap                                   ; and start over again
+
+; 6 instructions
+
+//
+// helper functions for hp41_pio_datain
+//
+
+% c-sdk {
+static inline void hp41_pio_datain_program_init(PIO pio, uint sm, uint offset, 
+        uint in_base_pin,               // base for input pin DATA
+        uint jmp_pin)                   // pin used in jmp, this will be D0_TIME
+    
+{
+    pio_sm_config c = hp41_pio_datain_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, in_base_pin);
+    sm_config_set_jmp_pin(&c, jmp_pin);  
+
+    // Configure Input Shift Register ISR
+    // Shifting to right matches HP41 bit order
+    // for DATA input autopush is enabled for the first 32 DATA bits
+    sm_config_set_in_shift(
+        &c,
+        true,  // Shift-to-right = true
+        true,  // Autopush enabled for pushing 32 databits
+        32     // Autopush threshold = 32
+    );
+
+    // load the configuration and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+
+    // and start the pio state machine
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+
+.program hp41_pio_isaout
+
+; ****************************************
+; **   HP41 PIO interface
+; **   state machine for ISA output (instruction and carry)
+; **   (C) 2023 Meindert Kuipers
+; ****************************************
+
+; ** IMPORTANT: CARRY output is not tested!
+; **
+
+; ** pins used:     
+; **    inputs:     CLK01       GPIO07  HP41 CLK01 signal
+; **                CLK02       GPIO08  HP41 CLK02 signal
+; **                DATA        GPIO09  HP41 DATA signal
+; **                ISA         GPIO10  HP41 ISA signal
+; **                SYNC        GPIO11  HP41 SYNC signal
+; **                D0_TIME     GPIO26, active low signal!
+; **                                    is active low during DATA bit D0 between the rising edges of CLK02
+; **                                    used to end DATA cycle and to issue the ISA carry bit when requested
+; **                                    used for timing FI flag output
+; **                SYNC_TIME   GPIO27, active during ISA INSTRUCTION, same as SYNC but at all cycles
+; **                                    used for timing ISA INSTRUCTION output
+; **   outputs:     ISA_OUT     GPIO14, ISA output signal (before level shifter)
+; **                ISA_OE      GPIO19, ISA Output Enable (controlling the level shifter output)
+; **                                    this is an active low signal!
+
+; **    
+; ** out base will be ISA_OUT (GPIO 14)
+; ** sideset base will be ISA_OE (GPIO 19), 1 sideset signal only
+
+.side_set 1                                     ; one bit for sideset, this will be ISA_OE
+
+.wrap_target 
+public handle_carry:                            ; code to send out the carry bit at D0_TIME
+        pull block              side 1          ; clear ISA_OE, wait for any data
+                                                ; this is our parking spot to wait for the carry bit
+                                                ; send any data with 1's to the TX FIFO for a carry bit set
+                                                ; send 0's to clear carry, but better not send anything
+                                                ; do a forced jmp to isa_inst_out for INSTRUCTION output
+        wait 0 gpio 26          side 1          ; wait until start of D0_TIME (remember, active low!)
+        out pins, 1             side 0          ; set ISA_OUT and ISA_OE 
+        wait 1 gpio 26          side 0          ; and wait for end of D0_TIME
+        jmp handle_carry        side 1          ; back to parking space
+
+                                                ; we get here only after a forced jump when 
+                                                ; an ISA INSTRUCTION has to be sent
+                                                ; C software has to force this state machine to its start
+                                                ; in C do the forced jump first and then put data in the TX FIFO
+                                                ; this must be done of course before the rising edge of SYNC
+public isa_inst_out:
+        pull block              side 1          ; get data to send into OSR, blocking, clear ISA_OE
+        wait 1 gpio 27          side 1          ; wait for SYNC_TIME to go high
+        set x, 9                side 0          ; send 10 bits, set ISA_OE, now in ISA INSTRUCTION window
+isa_inst_loop:
+        wait 0 gpio 8           side 0          ; wait for falling edge of CLK02
+        out pins, 1             side 0          ; send 1 bit
+        wait 1 gpio 8           side 0          ; wait for rising edge of CLK02
+        jmp x--, isa_inst_loop  side 0          ; next bit
+        wait 0 gpio 27          side 0          ; wait for end of SYNC_TIME
+.wrap                                           ; now fall into our parking spot prior to D0_TIME
+
+; 13 instructions
+
+//
+// helper functions for hp41_pio_isaout
+//
+
+% c-sdk {
+static inline void hp41_pio_isaout_program_init(PIO pio, uint sm, uint offset, 
+        uint out_base_pin,              // base for output pin ISA_OUT
+        uint sideset_base_pin,          // base for sideset outputs ISA_OE
+        uint set_base_pin,              // (not used) base for set pins
+        uint jmp_pin)                   // (not used) pin used in jmp
+    
+{
+    pio_sm_config c = hp41_pio_isaout_program_get_default_config(offset);
+
+    // set correct pin direction for outputs
+    pio_sm_set_consecutive_pindirs(pio, sm, out_base_pin, 1, true);          // pin direction for ISA_OUT
+    pio_sm_set_consecutive_pindirs(pio, sm, sideset_base_pin, 1, true);      // pin direction for ISA_OE
+
+    sm_config_set_out_pins(&c, out_base_pin, 1);    // just using 1 output
+    sm_config_set_sideset_pins(&c, sideset_base_pin);
+    // sm_config_set_jmp_pin(&c, jmp_pin);  
+
+    // Configure Output Shift Register OSR
+    // Shifting to right matches HP41 bit order
+    // for ISA output no autopush is needed
+    sm_config_set_out_shift(
+        &c,
+        true,   // Shift-to-right = true
+        false,  // no Autopull
+        32      // Autopull threshold = 32, not used here
+    );
+
+    // connect the pins to the PIO for output
+    pio_gpio_init(pio, out_base_pin);               // ISA_OUT
+    pio_gpio_init(pio, sideset_base_pin);           // ISA_OE
+
+    // load the configuration and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+
+    // and start the pio state machine
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
